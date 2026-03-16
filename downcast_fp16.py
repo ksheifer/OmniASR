@@ -19,7 +19,7 @@ bits_per_param = 16
 bytes_per_param = bits_per_param // 8
 
 # Save the weights
-save_path = "/home/sheifer/asr/omniASR_1B_bf16.pt" 
+save_path = "/home/sheifer/asr/omniASR_1B_fp16.pt" 
 torch.save(pipeline.model.state_dict(), save_path)
 
 # Verify the result and calculate sizes
