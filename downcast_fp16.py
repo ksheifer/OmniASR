@@ -10,7 +10,7 @@ pipeline = ASRInferencePipeline(
 )
 
 # Convert weights to bfloat16
-pipeline.model = pipeline.model.to(dtype=torch.bfloat16)
+pipeline.model = pipeline.model.to(dtype=torch.float16)
 
 # Define variables for the prints
 current_dtype = next(pipeline.model.parameters()).dtype
