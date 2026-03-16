@@ -11,9 +11,9 @@ with open(ref_path, "r", encoding="utf-8") as f:
     reference = f.read().strip()
 
 # ================= CORE METRICS =================
+match_error_rate = mer(reference, hypothesis)
 word_error_rate = wer(reference, hypothesis)
 char_error_rate = cer(reference, hypothesis)
-match_error_rate = mer(reference, hypothesis)
 word_info_lost = wil(reference, hypothesis)
 word_info_preserved = wip(reference, hypothesis)
 
@@ -86,9 +86,9 @@ hyph_precision = correct_hyph / hyp_hyph_total if hyp_hyph_total else 1.0
 # ================= REPORT =================
 report = f"""
 === CORE METRICS ===
+MER: {match_error_rate:.3f}
 WER: {word_error_rate:.3f}
 CER: {char_error_rate:.3f}
-MER: {match_error_rate:.3f}
 WIL: {word_info_lost:.3f}
 WIP: {word_info_preserved:.3f}
 
