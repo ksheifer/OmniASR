@@ -38,12 +38,10 @@ bytes_per_param = tensor.element_size()
 bits_per_param = bytes_per_param * 8
 gb_size = size_bytes / 1e9
 gib_size = size_bytes / 1024**3
-storage_precision = "FP32" if dtype == torch.float32 else "FP16/BF16"
 
 print(f"{'Data Type':<30} {dtype}")
 print(f"{'Bits per parameter':<30} {bytes_per_param} bytes ({bits_per_param} bits)")
-print(f"{'Precision (Storage)':<30} {storage_precision}")
-print(f"{'Precision (Inference)':<30} FP16 / BF16")
+print(f"{'Total Size (Bytes)':<30} {size_bytes:,} B") 
 print(f"{'Gigabytes':<30} {gb_size:.2f} GB")
 print(f"{'Gibibytes':<30} {gib_size:.2f} GiB")
 
