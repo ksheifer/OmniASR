@@ -9,16 +9,33 @@ from typing import List, Tuple, Dict, Any
 import librosa
 import numpy as np
 import torch
-import torchaudio
 from textgrid import TextGrid, IntervalTier
 from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
+
+
+"""
+Forced alignment for long Sakha recordings using wav2vec2 CTC.
+
+This version is based on the older script structure, but adds safeguards so it:
+- does not crash when a text chunk is too long for a short audio segment
+- trims reference text to the actual CTC capacity of each segment
+- skips unalignable chunks instead of failing
+- advances transcript index only when alignment succeeded
+- is safer for very long recordings, including multi-hour audio
+
+Outputs:
+- words.txt
+- segments.txt
+- alignment.TextGrid
+- debug_segments.json
+"""
 
 
 # =========================
 # PATHS
 # =========================
 AUDIO_PATH = "/Users/karinasheifer/Documents/UCSB/ASR/MFA/corpus/balyksyt.wav"
-TRANSCRIPT_PATH = "/Users/karinasheifer/Documents/UCSB/ASR/MFA/corpus/balyksyt.txt"
+TRANSCRIPT_PATH = "/Users/karinasheifer/Documents/UCSB/ASR/MFA/corpus/balyksyt_p.txt"
 OUTPUT_DIR = "/Users/karinasheifer/Documents/UCSB/ASR/MFA/corpus/balyksyt"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -32,14 +49,19 @@ TARGET_SR = 16000
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # silence / segmentation
-TOP_DB = 28                # lower = more sensitive splitting
-MIN_SEGMENT_SEC = 1.0      # discard/merge very tiny segments
-MAX_SEGMENT_SEC = 25.0     # split very long speech intervals
-MERGE_GAP_SEC = 0.25       # merge segments separated by tiny gaps
+TOP_DB = 28
+MIN_SEGMENT_SEC = 1.0
+MAX_SEGMENT_SEC = 25.0
+MERGE_GAP_SEC = 0.25
 
 # transcript matching
 SEARCH_EXTRA_WORDS = 20
 SEARCH_MULTIPLIER = 2.2
+
+# alignment safety
+CTC_SAFETY_RATIO = 0.85       # max usable token/frame ratio
+MIN_AUDIO_SEC_FOR_ALIGNMENT = 0.30
+MAX_WORDS_PER_SEGMENT = 80    # extra hard cap for safety on long recordings
 
 # normalization
 KEEP_CHARS_REGEX = r"[^а-яөүһҕңёіa-z0-9\s\-']"
@@ -166,7 +188,6 @@ def get_vocab_maps(processor: Wav2Vec2Processor):
 
     word_delim = getattr(processor.tokenizer, "word_delimiter_token", "|")
     if word_delim not in vocab:
-        # fallback seen in some tokenizers
         if "|" in vocab:
             word_delim = "|"
         else:
@@ -189,9 +210,6 @@ def encode_text_for_ctc(text: str, vocab: Dict[str, int], word_delim: str) -> Tu
         if tok in vocab:
             chars.append(tok)
             token_ids.append(vocab[tok])
-        else:
-            # silently skip unsupported chars
-            continue
 
     return token_ids, chars
 
@@ -233,9 +251,11 @@ def build_trellis(emission: torch.Tensor, tokens: List[int], blank_id: int) -> t
     trellis[1:, 0] = torch.cumsum(emission[:, blank_id], dim=0)
     trellis[0, 1:] = -float("inf")
 
+    token_tensor = torch.tensor(tokens, dtype=torch.long)
+
     for t in range(T):
         stay = trellis[t, 1:] + emission[t, blank_id]
-        change = trellis[t, :-1] + emission[t, tokens]
+        change = trellis[t, :-1] + emission[t, token_tensor]
         trellis[t + 1, 1:] = torch.maximum(stay, change)
 
     return trellis
@@ -333,11 +353,10 @@ def char_segments_to_word_segments(char_segments: List[SegmentSpan], word_delim:
                 scores = []
             continue
 
-        ch = seg.label
         if current_start is None:
             current_start = seg.start
         current_end = seg.end
-        current_chars.append(ch)
+        current_chars.append(seg.label)
         scores.append(seg.score)
 
     if current_chars:
@@ -353,6 +372,54 @@ def char_segments_to_word_segments(char_segments: List[SegmentSpan], word_delim:
     return words
 
 
+# =========================
+# SAFETY HELPERS
+# =========================
+def trim_ref_text_to_emission_capacity(
+    text: str,
+    emission: torch.Tensor,
+    vocab: Dict[str, int],
+    word_delim: str,
+    safety_ratio: float = 0.85,
+    max_words: int = 80,
+) -> str:
+    """
+    CTC alignment fails if transcript tokens are too long for the available
+    number of acoustic frames. This trims the text to something alignable.
+
+    Also adds a hard cap on word count for long recordings.
+    """
+    words = words_from_text(text)
+    if not words:
+        return text
+
+    if len(words) > max_words:
+        words = words[:max_words]
+
+    max_frames = emission.size(0)
+    max_tokens = max(1, int(max_frames * safety_ratio))
+
+    kept_words = []
+
+    for w in words:
+        candidate_words = kept_words + [w]
+        candidate_text = " ".join(candidate_words)
+        token_ids, _ = encode_text_for_ctc(candidate_text, vocab, word_delim)
+
+        if len(token_ids) <= max_tokens:
+            kept_words.append(w)
+        else:
+            break
+
+    if not kept_words:
+        return words[0]
+
+    return " ".join(kept_words)
+
+
+# =========================
+# ALIGNMENT
+# =========================
 def force_align_text_to_audio(
     wav_segment: np.ndarray,
     text: str,
@@ -362,28 +429,48 @@ def force_align_text_to_audio(
     blank_id: int,
     word_delim: str,
     sr: int = 16000,
-) -> Tuple[List[SegmentSpan], str]:
+) -> Tuple[List[SegmentSpan], str, str, bool]:
     """
-    Returns word-level aligned segments and greedy hypothesis.
+    Returns:
+      word-level aligned segments,
+      greedy hypothesis,
+      actually used reference text,
+      success flag
     """
     emission = infer_emission(wav_segment, processor, model, sr=sr)
     greedy_text = decode_greedy(processor, emission.unsqueeze(0))
 
-    token_ids, token_symbols = encode_text_for_ctc(text, vocab, word_delim)
+    safe_text = trim_ref_text_to_emission_capacity(
+        text=text,
+        emission=emission,
+        vocab=vocab,
+        word_delim=word_delim,
+        safety_ratio=CTC_SAFETY_RATIO,
+        max_words=MAX_WORDS_PER_SEGMENT,
+    )
+
+    token_ids, token_symbols = encode_text_for_ctc(safe_text, vocab, word_delim)
     if not token_ids:
-        return [], greedy_text
+        return [], greedy_text, safe_text, False
 
     trellis = build_trellis(emission, token_ids, blank_id)
-    path = backtrack(trellis, emission, token_ids, blank_id)
+
+    try:
+        path = backtrack(trellis, emission, token_ids, blank_id)
+    except ValueError:
+        return [], greedy_text, safe_text, False
 
     if not path:
-        return [], greedy_text
+        return [], greedy_text, safe_text, False
 
     frame_sec = len(wav_segment) / sr / emission.size(0)
     char_segments = merge_repeats(path, token_symbols, frame_sec)
     word_segments = char_segments_to_word_segments(char_segments, word_delim)
 
-    return word_segments, greedy_text
+    if not word_segments:
+        return [], greedy_text, safe_text, False
+
+    return word_segments, greedy_text, safe_text, True
 
 
 # =========================
@@ -460,7 +547,7 @@ def main():
         end_sample = int(seg_end * sr)
         wav_seg = wav[start_sample:end_sample]
 
-        if len(wav_seg) < int(0.3 * sr):
+        if len(wav_seg) < int(MIN_AUDIO_SEC_FOR_ALIGNMENT * sr):
             continue
 
         print(f"[{seg_i+1}/{len(speech_segments)}] {seg_start:.2f}-{seg_end:.2f}s")
@@ -481,8 +568,27 @@ def main():
         ref_slice_words = ref_words[start_idx:end_idx]
         ref_slice_text = " ".join(ref_slice_words)
 
+        if not ref_slice_text.strip():
+            debug_segments.append(
+                {
+                    "segment_index": seg_i,
+                    "audio_start": seg_start,
+                    "audio_end": seg_end,
+                    "greedy_prediction": pred_text,
+                    "matched_reference_start_word": start_idx,
+                    "matched_reference_end_word": end_idx,
+                    "matched_reference_text": ref_slice_text,
+                    "used_reference_text": "",
+                    "similarity": sim,
+                    "aligned_word_count": 0,
+                    "alignment_success": False,
+                    "skipped_reason": "empty_reference_text",
+                }
+            )
+            continue
+
         # second pass: actual forced alignment against chosen reference slice
-        word_segments, greedy_text = force_align_text_to_audio(
+        word_segments, greedy_text, used_ref_text, success = force_align_text_to_audio(
             wav_segment=wav_seg,
             text=ref_slice_text,
             processor=processor,
@@ -493,7 +599,6 @@ def main():
             sr=sr,
         )
 
-        # shift local times to global times
         shifted_word_segments = []
         for ws in word_segments:
             shifted_word_segments.append(
@@ -516,12 +621,18 @@ def main():
                 "matched_reference_start_word": start_idx,
                 "matched_reference_end_word": end_idx,
                 "matched_reference_text": ref_slice_text,
+                "used_reference_text": used_ref_text,
                 "similarity": sim,
                 "aligned_word_count": len(shifted_word_segments),
+                "alignment_success": success,
             }
         )
 
-        ref_idx = end_idx
+        # advance transcript only if alignment succeeded
+        if success and len(shifted_word_segments) > 0:
+            used_words = words_from_text(used_ref_text)
+            ref_idx = min(start_idx + len(used_words), len(ref_words))
+
         if ref_idx >= len(ref_words):
             break
 
@@ -541,7 +652,7 @@ def main():
         for d in debug_segments:
             f.write(
                 f"{d['audio_start']:.3f}\t{d['audio_end']:.3f}\t"
-                f"{d['matched_reference_text']}\n"
+                f"{d.get('used_reference_text', '')}\n"
             )
 
     # =========================
