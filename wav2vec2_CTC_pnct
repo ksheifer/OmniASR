@@ -13,34 +13,12 @@ from textgrid import TextGrid, IntervalTier
 from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
 
 
-"""
-Forced alignment for long Sakha recordings using wav2vec2 CTC.
-
-This version:
-- aligns against normalized text without punctuation
-- restores original punctuation in outputs
-- creates two TextGrid tiers:
-    1. words_norm  -> normalized aligned words
-    2. words_punct -> original surface words with punctuation
-- does not crash when a text chunk is too long for a short audio segment
-- trims reference text to the actual CTC capacity of each segment
-- skips unalignable chunks instead of failing
-- advances transcript index only when alignment succeeded
-
-Outputs:
-- words.txt
-- segments.txt
-- alignment.TextGrid
-- debug_segments.json
-"""
-
-
 # =========================
 # PATHS
 # =========================
 AUDIO_PATH = "/Users/karinasheifer/Documents/UCSB/ASR/MFA/corpus/balyksyt.wav"
 TRANSCRIPT_PATH = "/Users/karinasheifer/Documents/UCSB/ASR/MFA/corpus/balyksyt_p.txt"
-OUTPUT_DIR = "/Users/karinasheifer/Documents/UCSB/ASR/MFA/corpus/balyksyt_p"
+OUTPUT_DIR = "/Users/karinasheifer/Documents/UCSB/ASR/MFA/corpus/balyksyt"
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -69,6 +47,13 @@ MAX_WORDS_PER_SEGMENT = 80
 
 # normalization
 KEEP_CHARS_REGEX = r"[^а-яөүһҕңёіa-z0-9\s\-']"
+
+# sentence-final punctuation
+SENTENCE_END_RE = re.compile(r'[.!?…]+[)"»]*$')
+
+# fallback sentence split parameters
+MAX_SENTENCE_DURATION = 25.0
+LONG_PAUSE_FOR_SENT_BOUNDARY = 0.8
 
 
 # =========================
@@ -103,21 +88,28 @@ def words_from_text(text: str) -> List[str]:
     return normalize_text(text).split()
 
 
-def original_token_mapping(text: str) -> List[Tuple[str, str]]:
+def flatten_surface_word_mapping(text: str) -> List[Tuple[str, str]]:
     """
-    Returns pairs:
-      (normalized_word, original_token_with_punctuation)
+    Build robust per-word mapping from original text.
 
     Example:
-      'Мин, барда.' -> [('мин', 'Мин,'), ('барда', 'барда.')]
+      'Ок-сиэ, ким...' ->
+      [('ок-сиэ', 'Ок-сиэ,'), ('ким', 'ким'), ...]
     """
     original_tokens = text.split()
-    mapping = []
+    mapping: List[Tuple[str, str]] = []
 
     for tok in original_tokens:
-        norm = normalize_text(tok)
-        if norm:
-            mapping.append((norm, tok))
+        norm_parts = normalize_text(tok).split()
+        if not norm_parts:
+            continue
+
+        if len(norm_parts) == 1:
+            mapping.append((norm_parts[0], tok))
+        else:
+            for part in norm_parts[:-1]:
+                mapping.append((part, part))
+            mapping.append((norm_parts[-1], tok))
 
     return mapping
 
@@ -416,26 +408,83 @@ def trim_ref_text_to_emission_capacity(
 
 
 def map_normalized_words_to_surface(words_norm: List[str], surface_pairs: List[Tuple[str, str]], start_idx: int) -> Tuple[List[str], int]:
-    """
-    Map normalized words back to original surface tokens with punctuation.
-    Returns:
-      surface_tokens_for_this_slice,
-      new_surface_index
-    """
     surface_out = []
     i = start_idx
 
     for wn in words_norm:
+        matched = False
         while i < len(surface_pairs):
             norm_tok, surface_tok = surface_pairs[i]
             i += 1
             if norm_tok == wn:
                 surface_out.append(surface_tok)
+                matched = True
                 break
-        else:
+
+        if not matched:
             surface_out.append(wn)
 
     return surface_out, i
+
+
+def build_sentence_segments(word_segments_punct: List[SegmentSpan]) -> List[SegmentSpan]:
+    if not word_segments_punct:
+        return []
+
+    sentences = []
+    cur_tokens = []
+    cur_start = None
+    cur_end = None
+    cur_scores = []
+
+    for i, ws in enumerate(word_segments_punct):
+        if cur_start is None:
+            cur_start = ws.start
+
+        cur_tokens.append(ws.label)
+        cur_end = ws.end
+        cur_scores.append(ws.score)
+
+        is_final_punct = bool(SENTENCE_END_RE.search(ws.label))
+
+        next_gap = None
+        if i < len(word_segments_punct) - 1:
+            next_gap = word_segments_punct[i + 1].start - ws.end
+
+        cur_duration = cur_end - cur_start
+        force_break = False
+
+        if next_gap is not None and next_gap >= LONG_PAUSE_FOR_SENT_BOUNDARY and cur_duration >= 2.0:
+            force_break = True
+
+        if cur_duration >= MAX_SENTENCE_DURATION:
+            force_break = True
+
+        if is_final_punct or force_break:
+            sentences.append(
+                SegmentSpan(
+                    label=" ".join(cur_tokens),
+                    start=cur_start,
+                    end=cur_end,
+                    score=sum(cur_scores) / len(cur_scores),
+                )
+            )
+            cur_tokens = []
+            cur_start = None
+            cur_end = None
+            cur_scores = []
+
+    if cur_tokens:
+        sentences.append(
+            SegmentSpan(
+                label=" ".join(cur_tokens),
+                start=cur_start,
+                end=cur_end,
+                score=sum(cur_scores) / len(cur_scores),
+            )
+        )
+
+    return sentences
 
 
 # =========================
@@ -532,8 +581,7 @@ def main():
 
     transcript_norm = normalize_text(transcript_raw)
     ref_words = transcript_norm.split()
-
-    surface_pairs = original_token_mapping(transcript_raw)
+    surface_pairs = flatten_surface_word_mapping(transcript_raw)
 
     print("Loading model...")
     processor, model = load_model_and_processor(MODEL_NAME)
@@ -672,13 +720,15 @@ def main():
         if ref_idx >= len(ref_words):
             break
 
-    # words.txt with punctuation
+    sentence_segments = build_sentence_segments(aligned_words_punct_all)
+
+    # words.txt with normalized aligned words
     words_txt_path = os.path.join(OUTPUT_DIR, "words.txt")
     with open(words_txt_path, "w", encoding="utf-8") as f:
-        for w in aligned_words_punct_all:
+        for w in aligned_words_norm_all:
             f.write(f"{w.start:.3f}\t{w.end:.3f}\t{w.label}\n")
 
-    # segments.txt with punctuation
+    # segments.txt with punctuated segment text
     segments_txt_path = os.path.join(OUTPUT_DIR, "segments.txt")
     with open(segments_txt_path, "w", encoding="utf-8") as f:
         for d in debug_segments:
@@ -687,21 +737,27 @@ def main():
                 f"{d.get('used_reference_surface_text', '')}\n"
             )
 
-    # TextGrid with two tiers
+    # sentences.txt
+    sentences_txt_path = os.path.join(OUTPUT_DIR, "sentences.txt")
+    with open(sentences_txt_path, "w", encoding="utf-8") as f:
+        for s in sentence_segments:
+            f.write(f"{s.start:.3f}\t{s.end:.3f}\t{s.label}\n")
+
+    # TextGrid with two tiers only
     tg = TextGrid(minTime=0.0, maxTime=total_duration)
     word_tier_norm = IntervalTier(name="words_norm", minTime=0.0, maxTime=total_duration)
-    word_tier_punct = IntervalTier(name="words_punct", minTime=0.0, maxTime=total_duration)
+    sent_tier_punct = IntervalTier(name="sentences_punct", minTime=0.0, maxTime=total_duration)
 
     for w in aligned_words_norm_all:
         if w.end > w.start:
             word_tier_norm.add(w.start, w.end, w.label)
 
-    for w in aligned_words_punct_all:
-        if w.end > w.start:
-            word_tier_punct.add(w.start, w.end, w.label)
+    for s in sentence_segments:
+        if s.end > s.start:
+            sent_tier_punct.add(s.start, s.end, s.label)
 
     tg.append(word_tier_norm)
-    tg.append(word_tier_punct)
+    tg.append(sent_tier_punct)
     tg.write(os.path.join(OUTPUT_DIR, "alignment.TextGrid"))
 
     debug_json_path = os.path.join(OUTPUT_DIR, "debug_segments.json")
@@ -712,6 +768,7 @@ def main():
     print("Saved:")
     print(words_txt_path)
     print(segments_txt_path)
+    print(sentences_txt_path)
     print(os.path.join(OUTPUT_DIR, "alignment.TextGrid"))
     print(debug_json_path)
 
