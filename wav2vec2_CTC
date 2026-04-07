@@ -1,44 +1,30 @@
 import os
 import re
-import json
 import math
 import difflib
 from dataclasses import dataclass
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict
 
 import librosa
 import numpy as np
 import torch
+import soundfile as sf
 from textgrid import TextGrid, IntervalTier
 from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
 
-
-"""
-Forced alignment for long Sakha recordings using wav2vec2 CTC.
-
-This version is based on the older script structure, but adds safeguards so it:
-- does not crash when a text chunk is too long for a short audio segment
-- trims reference text to the actual CTC capacity of each segment
-- skips unalignable chunks instead of failing
-- advances transcript index only when alignment succeeded
-- is safer for very long recordings, including multi-hour audio
-
-Outputs:
-- words.txt
-- segments.txt
-- alignment.TextGrid
-- debug_segments.json
-"""
+torch.set_num_threads(4)
 
 
 # =========================
 # PATHS
 # =========================
 AUDIO_PATH = "/Users/karinasheifer/Documents/UCSB/ASR/MFA/corpus/balyksyt.wav"
-TRANSCRIPT_PATH = "/Users/karinasheifer/Documents/UCSB/ASR/MFA/corpus/balyksyt_p.txt"
+TRANSCRIPT_PATH = "/Users/karinasheifer/Documents/UCSB/ASR/MFA/corpus/balyksyt.txt"
 OUTPUT_DIR = "/Users/karinasheifer/Documents/UCSB/ASR/MFA/corpus/balyksyt"
+SENTENCE_WAV_DIR = os.path.join(OUTPUT_DIR, "sentence_wavs")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(SENTENCE_WAV_DIR, exist_ok=True)
 
 
 # =========================
@@ -59,12 +45,23 @@ SEARCH_EXTRA_WORDS = 20
 SEARCH_MULTIPLIER = 2.2
 
 # alignment safety
-CTC_SAFETY_RATIO = 0.85       # max usable token/frame ratio
+CTC_SAFETY_RATIO = 0.85
 MIN_AUDIO_SEC_FOR_ALIGNMENT = 0.30
-MAX_WORDS_PER_SEGMENT = 80    # extra hard cap for safety on long recordings
+MAX_WORDS_PER_SEGMENT = 80
 
 # normalization
 KEEP_CHARS_REGEX = r"[^а-яөүһҕңёіa-z0-9\s\-']"
+
+# sentence-final punctuation
+SENTENCE_END_RE = re.compile(r'[.!?…]+[)"»]*$')
+
+# fallback sentence split parameters
+MAX_SENTENCE_DURATION = 25.0
+LONG_PAUSE_FOR_SENT_BOUNDARY = 0.8
+
+# wav export padding
+SENTENCE_PAD_SEC = 0.05
+SENTENCE_ZERO_PAD = 5
 
 
 # =========================
@@ -91,13 +88,30 @@ class SegmentSpan:
 def normalize_text(text: str) -> str:
     text = text.lower().replace("—", "-").replace("–", "-")
     text = re.sub(KEEP_CHARS_REGEX, " ", text, flags=re.IGNORECASE)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def words_from_text(text: str) -> List[str]:
-    text = normalize_text(text)
-    return text.split()
+    return normalize_text(text).split()
+
+
+def flatten_surface_word_mapping(text: str) -> List[Tuple[str, str]]:
+    mapping = []
+    for tok in text.split():
+        norm_parts = normalize_text(tok).split()
+        if not norm_parts:
+            continue
+        for part in norm_parts[:-1]:
+            mapping.append((part, part))
+        mapping.append((norm_parts[-1], tok))
+    return mapping
+
+
+def get_base_stem(path: str) -> str:
+    stem = os.path.splitext(os.path.basename(path))[0]
+    stem = re.sub(r"\s+", "_", stem)
+    stem = re.sub(r"[^a-zA-Z0-9а-яөүһҕңёі_-]+", "", stem)
+    return stem or "audio"
 
 
 # =========================
@@ -112,15 +126,13 @@ def split_long_interval(start_s: float, end_s: float, max_len: float) -> List[Tu
     dur = end_s - start_s
     if dur <= max_len:
         return [(start_s, end_s)]
-    n = math.ceil(dur / max_len)
-    chunk = dur / n
-    out = []
-    cur = start_s
-    for _ in range(n):
+    chunk = dur / math.ceil(dur / max_len)
+    result, cur = [], start_s
+    while cur < end_s:
         nxt = min(end_s, cur + chunk)
-        out.append((cur, nxt))
+        result.append((cur, nxt))
         cur = nxt
-    return out
+    return result
 
 
 def get_speech_segments(
@@ -135,37 +147,29 @@ def get_speech_segments(
     if len(raw) == 0:
         return [(0.0, len(wav) / sr)]
 
-    segments = [(start / sr, end / sr) for start, end in raw]
+    segments = [(s / sr, e / sr) for s, e in raw]
 
-    # merge close intervals
     merged = []
-    cur_start, cur_end = segments[0]
+    cur_s, cur_e = segments[0]
     for s, e in segments[1:]:
-        if s - cur_end <= merge_gap_sec:
-            cur_end = e
+        if s - cur_e <= merge_gap_sec:
+            cur_e = e
         else:
-            merged.append((cur_start, cur_end))
-            cur_start, cur_end = s, e
-    merged.append((cur_start, cur_end))
+            merged.append((cur_s, cur_e))
+            cur_s, cur_e = s, e
+    merged.append((cur_s, cur_e))
 
-    # drop or merge tiny intervals
     cleaned = []
     for s, e in merged:
         if e - s < min_seg_sec:
             if cleaned:
-                prev_s, prev_e = cleaned[-1]
-                cleaned[-1] = (prev_s, e)
+                cleaned[-1] = (cleaned[-1][0], e)
             else:
                 cleaned.append((s, e))
         else:
             cleaned.append((s, e))
 
-    # split very long intervals
-    final = []
-    for s, e in cleaned:
-        final.extend(split_long_interval(s, e, max_seg_sec))
-
-    return final
+    return [sub for s, e in cleaned for sub in split_long_interval(s, e, max_seg_sec)]
 
 
 # =========================
@@ -184,48 +188,34 @@ def get_vocab_maps(processor: Wav2Vec2Processor):
 
     blank_id = processor.tokenizer.pad_token_id
     if blank_id is None:
-        raise ValueError("Tokenizer has no pad_token_id; cannot determine blank token for CTC.")
+        raise ValueError("Tokenizer has no pad_token_id.")
 
     word_delim = getattr(processor.tokenizer, "word_delimiter_token", "|")
     if word_delim not in vocab:
         if "|" in vocab:
             word_delim = "|"
         else:
-            raise ValueError("Could not find word delimiter token in tokenizer vocab.")
+            raise ValueError("Could not find word delimiter token.")
 
     return vocab, id_to_token, blank_id, word_delim
 
 
 def encode_text_for_ctc(text: str, vocab: Dict[str, int], word_delim: str) -> Tuple[List[int], List[str]]:
-    """
-    Convert normalized text to tokenizer tokens at character level.
-    Spaces become word delimiter token.
-    """
-    text = normalize_text(text)
-    chars = []
-    token_ids = []
-
-    for ch in text:
+    chars, token_ids = [], []
+    for ch in normalize_text(text):
         tok = word_delim if ch == " " else ch
         if tok in vocab:
             chars.append(tok)
             token_ids.append(vocab[tok])
-
     return token_ids, chars
 
 
 def decode_greedy(processor: Wav2Vec2Processor, logits: torch.Tensor) -> str:
     pred_ids = torch.argmax(logits, dim=-1)
-    text = processor.batch_decode(pred_ids)[0]
-    return normalize_text(text)
+    return normalize_text(processor.batch_decode(pred_ids)[0])
 
 
-def infer_emission(
-    wav_segment: np.ndarray,
-    processor: Wav2Vec2Processor,
-    model: Wav2Vec2ForCTC,
-    sr: int = 16000,
-) -> torch.Tensor:
+def infer_emission(wav_segment: np.ndarray, processor, model, sr: int = 16000) -> torch.Tensor:
     inputs = processor(wav_segment, sampling_rate=sr, return_tensors="pt", padding=True)
     with torch.no_grad():
         logits = model(inputs.input_values.to(DEVICE)).logits[0].cpu()
@@ -236,20 +226,10 @@ def infer_emission(
 # CTC TRELLIS ALIGNMENT
 # =========================
 def build_trellis(emission: torch.Tensor, tokens: List[int], blank_id: int) -> torch.Tensor:
-    """
-    emission: (num_frames, vocab_size) log-probabilities
-    tokens: transcript token ids
-    returns trellis of shape (T+1, N+1)
-    """
-    T = emission.size(0)
-    N = len(tokens)
-
-    trellis = torch.empty((T + 1, N + 1), dtype=torch.float32)
-    trellis.fill_(-float("inf"))
-
+    T, N = emission.size(0), len(tokens)
+    trellis = torch.full((T + 1, N + 1), -float("inf"))
     trellis[0, 0] = 0.0
     trellis[1:, 0] = torch.cumsum(emission[:, blank_id], dim=0)
-    trellis[0, 1:] = -float("inf")
 
     token_tensor = torch.tensor(tokens, dtype=torch.long)
 
@@ -261,15 +241,7 @@ def build_trellis(emission: torch.Tensor, tokens: List[int], blank_id: int) -> t
     return trellis
 
 
-def backtrack(
-    trellis: torch.Tensor,
-    emission: torch.Tensor,
-    tokens: List[int],
-    blank_id: int,
-) -> List[Point]:
-    """
-    Backtrack best path ending at the best frame for final token.
-    """
+def backtrack(trellis: torch.Tensor, emission: torch.Tensor, tokens: List[int], blank_id: int) -> List[Point]:
     T, N = trellis.size(0) - 1, trellis.size(1) - 1
     if N == 0:
         return []
@@ -285,11 +257,12 @@ def backtrack(
         p_stay = trellis[t - 1, j] + emission[t - 1, blank_id]
         p_change = trellis[t - 1, j - 1] + emission[t - 1, tokens[j - 1]]
 
-        changed = p_change > p_stay
-
-        if changed:
-            score = float(emission[t - 1, tokens[j - 1]].exp().item())
-            path.append(Point(token_index=j - 1, time_index=t - 1, score=score))
+        if p_change > p_stay:
+            path.append(Point(
+                token_index=j - 1,
+                time_index=t - 1,
+                score=float(emission[t - 1, tokens[j - 1]].exp())
+            ))
             j -= 1
         t -= 1
 
@@ -298,9 +271,6 @@ def backtrack(
 
 
 def merge_repeats(path: List[Point], token_symbols: List[str], frame_sec: float) -> List[SegmentSpan]:
-    if not path:
-        return []
-
     segments = []
     i = 0
     while i < len(path):
@@ -308,66 +278,50 @@ def merge_repeats(path: List[Point], token_symbols: List[str], frame_sec: float)
         while j < len(path) and path[j].token_index == path[i].token_index:
             j += 1
 
-        start_t = path[i].time_index
-        end_t = path[j - 1].time_index + 1
-        label = token_symbols[path[i].token_index]
-        score = sum(p.score for p in path[i:j]) / (j - i)
-
+        seg = path[i:j]
         segments.append(
             SegmentSpan(
-                label=label,
-                start=start_t * frame_sec,
-                end=end_t * frame_sec,
-                score=score,
+                label=token_symbols[path[i].token_index],
+                start=path[i].time_index * frame_sec,
+                end=(path[j - 1].time_index + 1) * frame_sec,
+                score=sum(p.score for p in seg) / len(seg),
             )
         )
         i = j
-
     return segments
 
 
 def char_segments_to_word_segments(char_segments: List[SegmentSpan], word_delim: str) -> List[SegmentSpan]:
-    """
-    Collapse char-level segments into word-level segments.
-    """
     words = []
-    current_chars = []
-    current_start = None
-    current_end = None
-    scores = []
+    buf_chars, buf_scores = [], []
+    w_start, w_end = None, None
 
     for seg in char_segments:
         if seg.label == word_delim:
-            if current_chars:
-                words.append(
-                    SegmentSpan(
-                        label="".join(current_chars),
-                        start=current_start,
-                        end=current_end,
-                        score=sum(scores) / len(scores),
-                    )
-                )
-                current_chars = []
-                current_start = None
-                current_end = None
-                scores = []
+            if buf_chars:
+                words.append(SegmentSpan(
+                    label="".join(buf_chars),
+                    start=w_start,
+                    end=w_end,
+                    score=sum(buf_scores) / len(buf_scores),
+                ))
+                buf_chars, buf_scores = [], []
+                w_start, w_end = None, None
             continue
 
-        if current_start is None:
-            current_start = seg.start
-        current_end = seg.end
-        current_chars.append(seg.label)
-        scores.append(seg.score)
+        if w_start is None:
+            w_start = seg.start
+        w_end = seg.end
+        buf_chars.append(seg.label)
+        buf_scores.append(seg.score)
 
-    if current_chars:
-        words.append(
-            SegmentSpan(
-                label="".join(current_chars),
-                start=current_start,
-                end=current_end,
-                score=sum(scores) / len(scores),
-            )
-        )
+    if buf_chars:
+        words.append(SegmentSpan(
+            label="".join(buf_chars),
+            start=w_start,
+            end=w_end,
+            score=sum(buf_scores) / len(buf_scores),
+        ))
 
     return words
 
@@ -383,65 +337,130 @@ def trim_ref_text_to_emission_capacity(
     safety_ratio: float = 0.85,
     max_words: int = 80,
 ) -> str:
-    """
-    CTC alignment fails if transcript tokens are too long for the available
-    number of acoustic frames. This trims the text to something alignable.
-
-    Also adds a hard cap on word count for long recordings.
-    """
-    words = words_from_text(text)
+    words = words_from_text(text)[:max_words]
     if not words:
         return text
 
-    if len(words) > max_words:
-        words = words[:max_words]
-
-    max_frames = emission.size(0)
-    max_tokens = max(1, int(max_frames * safety_ratio))
-
-    kept_words = []
+    max_tokens = max(1, int(emission.size(0) * safety_ratio))
+    kept = []
 
     for w in words:
-        candidate_words = kept_words + [w]
-        candidate_text = " ".join(candidate_words)
-        token_ids, _ = encode_text_for_ctc(candidate_text, vocab, word_delim)
-
+        candidate = " ".join(kept + [w])
+        token_ids, _ = encode_text_for_ctc(candidate, vocab, word_delim)
         if len(token_ids) <= max_tokens:
-            kept_words.append(w)
+            kept.append(w)
         else:
             break
 
-    if not kept_words:
-        return words[0]
+    return words[0] if not kept else " ".join(kept)
 
-    return " ".join(kept_words)
+
+def map_normalized_words_to_surface(
+    words_norm: List[str],
+    surface_pairs: List[Tuple[str, str]],
+    start_idx: int
+) -> Tuple[List[str], int]:
+    surface_out = []
+    i = start_idx
+
+    for wn in words_norm:
+        while i < len(surface_pairs):
+            norm_tok, surface_tok = surface_pairs[i]
+            i += 1
+            if norm_tok == wn:
+                surface_out.append(surface_tok)
+                break
+        else:
+            surface_out.append(wn)
+
+    return surface_out, i
+
+
+def build_sentence_segments(word_segments_punct: List[SegmentSpan]) -> List[SegmentSpan]:
+    sentences = []
+    cur_tokens, cur_scores = [], []
+    cur_start, cur_end = None, None
+
+    for i, ws in enumerate(word_segments_punct):
+        if cur_start is None:
+            cur_start = ws.start
+
+        cur_tokens.append(ws.label)
+        cur_scores.append(ws.score)
+        cur_end = ws.end
+
+        next_gap = None
+        if i < len(word_segments_punct) - 1:
+            next_gap = word_segments_punct[i + 1].start - ws.end
+
+        cur_duration = cur_end - cur_start
+        force_break = (
+            (next_gap is not None and next_gap >= LONG_PAUSE_FOR_SENT_BOUNDARY and cur_duration >= 2.0)
+            or cur_duration >= MAX_SENTENCE_DURATION
+        )
+
+        if SENTENCE_END_RE.search(ws.label) or force_break:
+            sentences.append(SegmentSpan(
+                label=" ".join(cur_tokens),
+                start=cur_start,
+                end=cur_end,
+                score=sum(cur_scores) / len(cur_scores),
+            ))
+            cur_tokens, cur_scores = [], []
+            cur_start, cur_end = None, None
+
+    if cur_tokens:
+        sentences.append(SegmentSpan(
+            label=" ".join(cur_tokens),
+            start=cur_start,
+            end=cur_end,
+            score=sum(cur_scores) / len(cur_scores),
+        ))
+
+    return sentences
+
+
+def export_sentence_wavs(
+    wav: np.ndarray,
+    sr: int,
+    sentence_segments: List[SegmentSpan],
+    out_dir: str,
+    base_stem: str,
+    pad_sec: float = 0.05,
+    zero_pad: int = 5,
+) -> None:
+    for i, seg in enumerate(sentence_segments, start=1):
+        start = max(0.0, seg.start - pad_sec)
+        end = min(len(wav) / sr, seg.end + pad_sec)
+
+        chunk = wav[int(round(start * sr)):int(round(end * sr))]
+        sent_id = f"{base_stem}_{i:0{zero_pad}d}"
+
+        wav_path = os.path.join(out_dir, f"{sent_id}.wav")
+        txt_path = os.path.join(out_dir, f"{sent_id}.txt")
+
+        sf.write(wav_path, chunk, sr)
+        with open(txt_path, "w", encoding="utf-8") as f:
+            f.write(seg.label.strip() + "\n")
 
 
 # =========================
-# ALIGNMENT
+# FAST ALIGNMENT WRAPPER
 # =========================
-def force_align_text_to_audio(
+def align_with_existing_emission(
+    emission: torch.Tensor,
     wav_segment: np.ndarray,
-    text: str,
-    processor: Wav2Vec2Processor,
-    model: Wav2Vec2ForCTC,
+    ref_text: str,
+    processor,
     vocab: Dict[str, int],
     blank_id: int,
     word_delim: str,
     sr: int = 16000,
 ) -> Tuple[List[SegmentSpan], str, str, bool]:
-    """
-    Returns:
-      word-level aligned segments,
-      greedy hypothesis,
-      actually used reference text,
-      success flag
-    """
-    emission = infer_emission(wav_segment, processor, model, sr=sr)
     greedy_text = decode_greedy(processor, emission.unsqueeze(0))
 
     safe_text = trim_ref_text_to_emission_capacity(
-        text=text,
+        text=ref_text,
         emission=emission,
         vocab=vocab,
         word_delim=word_delim,
@@ -467,10 +486,7 @@ def force_align_text_to_audio(
     char_segments = merge_repeats(path, token_symbols, frame_sec)
     word_segments = char_segments_to_word_segments(char_segments, word_delim)
 
-    if not word_segments:
-        return [], greedy_text, safe_text, False
-
-    return word_segments, greedy_text, safe_text, True
+    return word_segments, greedy_text, safe_text, bool(word_segments)
 
 
 # =========================
@@ -483,21 +499,18 @@ def best_reference_slice(
     search_extra: int = 20,
     search_multiplier: float = 2.2,
 ) -> Tuple[int, int, float]:
-    """
-    Choose the best sequential slice of reference words for a chunk,
-    using greedy hypothesis similarity.
-    """
     pred_words = words_from_text(pred_text)
     if not pred_words:
         return start_idx, min(start_idx + 1, len(ref_words)), 0.0
 
     target_len = len(pred_words)
     min_len = max(1, int(target_len * 0.5))
-    max_len = max(min_len, int(target_len * search_multiplier) + search_extra)
+    max_len = int(target_len * search_multiplier) + search_extra
+    max_end = min(len(ref_words), start_idx + max_len)
 
     best = (start_idx, min(len(ref_words), start_idx + min_len), -1.0)
 
-    for end_idx in range(start_idx + min_len, min(len(ref_words), start_idx + max_len) + 1):
+    for end_idx in range(start_idx + min_len, max_end + 1):
         candidate = " ".join(ref_words[start_idx:end_idx])
         score = difflib.SequenceMatcher(None, pred_text, candidate).ratio()
         if score > best[2]:
@@ -519,8 +532,9 @@ def main():
     print("Loading transcript...")
     with open(TRANSCRIPT_PATH, "r", encoding="utf-8") as f:
         transcript_raw = f.read()
-    transcript_norm = normalize_text(transcript_raw)
-    ref_words = transcript_norm.split()
+
+    ref_words = normalize_text(transcript_raw).split()
+    surface_pairs = flatten_surface_word_mapping(transcript_raw)
 
     print("Loading model...")
     processor, model = load_model_and_processor(MODEL_NAME)
@@ -537,27 +551,25 @@ def main():
     )
     print(f"Detected {len(speech_segments)} speech segments")
 
-    aligned_words_all: List[SegmentSpan] = []
-    debug_segments: List[Dict[str, Any]] = []
+    aligned_words_norm_all: List[SegmentSpan] = []
+    aligned_words_punct_all: List[SegmentSpan] = []
 
     ref_idx = 0
+    surface_idx = 0
 
     for seg_i, (seg_start, seg_end) in enumerate(speech_segments):
-        start_sample = int(seg_start * sr)
-        end_sample = int(seg_end * sr)
-        wav_seg = wav[start_sample:end_sample]
+        wav_seg = wav[int(seg_start * sr):int(seg_end * sr)]
 
         if len(wav_seg) < int(MIN_AUDIO_SEC_FOR_ALIGNMENT * sr):
             continue
 
         print(f"[{seg_i+1}/{len(speech_segments)}] {seg_start:.2f}-{seg_end:.2f}s")
 
-        # first pass: get greedy hypothesis for matching
+        # SINGLE inference per segment
         emission = infer_emission(wav_seg, processor, model, sr=sr)
         pred_text = decode_greedy(processor, emission.unsqueeze(0))
 
-        # choose transcript slice
-        start_idx, end_idx, sim = best_reference_slice(
+        start_idx, end_idx, _ = best_reference_slice(
             pred_text=pred_text,
             ref_words=ref_words,
             start_idx=ref_idx,
@@ -565,122 +577,102 @@ def main():
             search_multiplier=SEARCH_MULTIPLIER,
         )
 
-        ref_slice_words = ref_words[start_idx:end_idx]
-        ref_slice_text = " ".join(ref_slice_words)
-
+        ref_slice_text = " ".join(ref_words[start_idx:end_idx])
         if not ref_slice_text.strip():
-            debug_segments.append(
-                {
-                    "segment_index": seg_i,
-                    "audio_start": seg_start,
-                    "audio_end": seg_end,
-                    "greedy_prediction": pred_text,
-                    "matched_reference_start_word": start_idx,
-                    "matched_reference_end_word": end_idx,
-                    "matched_reference_text": ref_slice_text,
-                    "used_reference_text": "",
-                    "similarity": sim,
-                    "aligned_word_count": 0,
-                    "alignment_success": False,
-                    "skipped_reason": "empty_reference_text",
-                }
-            )
             continue
 
-        # second pass: actual forced alignment against chosen reference slice
-        word_segments, greedy_text, used_ref_text, success = force_align_text_to_audio(
+        word_segments, _, used_ref_text, success = align_with_existing_emission(
+            emission=emission,
             wav_segment=wav_seg,
-            text=ref_slice_text,
+            ref_text=ref_slice_text,
             processor=processor,
-            model=model,
             vocab=vocab,
             blank_id=blank_id,
             word_delim=word_delim,
             sr=sr,
         )
 
-        shifted_word_segments = []
-        for ws in word_segments:
-            shifted_word_segments.append(
-                SegmentSpan(
-                    label=ws.label,
-                    start=ws.start + seg_start,
-                    end=ws.end + seg_start,
-                    score=ws.score,
-                )
-            )
-
-        aligned_words_all.extend(shifted_word_segments)
-
-        debug_segments.append(
-            {
-                "segment_index": seg_i,
-                "audio_start": seg_start,
-                "audio_end": seg_end,
-                "greedy_prediction": greedy_text,
-                "matched_reference_start_word": start_idx,
-                "matched_reference_end_word": end_idx,
-                "matched_reference_text": ref_slice_text,
-                "used_reference_text": used_ref_text,
-                "similarity": sim,
-                "aligned_word_count": len(shifted_word_segments),
-                "alignment_success": success,
-            }
+        used_ref_words = words_from_text(used_ref_text)
+        used_surface_tokens, new_surface_idx = map_normalized_words_to_surface(
+            used_ref_words,
+            surface_pairs,
+            surface_idx,
         )
 
-        # advance transcript only if alignment succeeded
-        if success and len(shifted_word_segments) > 0:
-            used_words = words_from_text(used_ref_text)
-            ref_idx = min(start_idx + len(used_words), len(ref_words))
+        for i, ws in enumerate(word_segments):
+            punct_label = used_surface_tokens[i] if i < len(used_surface_tokens) else ws.label
+
+            shifted_norm = SegmentSpan(
+                label=ws.label,
+                start=ws.start + seg_start,
+                end=ws.end + seg_start,
+                score=ws.score,
+            )
+            shifted_punct = SegmentSpan(
+                label=punct_label,
+                start=ws.start + seg_start,
+                end=ws.end + seg_start,
+                score=ws.score,
+            )
+
+            aligned_words_norm_all.append(shifted_norm)
+            aligned_words_punct_all.append(shifted_punct)
+
+        if success and word_segments:
+            ref_idx = min(start_idx + len(used_ref_words), len(ref_words))
+            surface_idx = new_surface_idx
 
         if ref_idx >= len(ref_words):
             break
 
-    # =========================
-    # SAVE words.txt
-    # =========================
-    words_txt_path = os.path.join(OUTPUT_DIR, "words.txt")
+    sentence_segments = build_sentence_segments(aligned_words_punct_all)
+
+    base_stem = get_base_stem(AUDIO_PATH)
+
+    export_sentence_wavs(
+        wav=wav,
+        sr=sr,
+        sentence_segments=sentence_segments,
+        out_dir=SENTENCE_WAV_DIR,
+        base_stem=base_stem,
+        pad_sec=SENTENCE_PAD_SEC,
+        zero_pad=SENTENCE_ZERO_PAD,
+    )
+
+    words_txt_path = os.path.join(OUTPUT_DIR, f"{base_stem}_words.txt")
     with open(words_txt_path, "w", encoding="utf-8") as f:
-        for w in aligned_words_all:
+        for w in aligned_words_norm_all:
             f.write(f"{w.start:.3f}\t{w.end:.3f}\t{w.label}\n")
 
-    # =========================
-    # SAVE segments.txt
-    # =========================
-    segments_txt_path = os.path.join(OUTPUT_DIR, "segments.txt")
-    with open(segments_txt_path, "w", encoding="utf-8") as f:
-        for d in debug_segments:
-            f.write(
-                f"{d['audio_start']:.3f}\t{d['audio_end']:.3f}\t"
-                f"{d.get('used_reference_text', '')}\n"
-            )
+    sentences_txt_path = os.path.join(OUTPUT_DIR, f"{base_stem}_sentences.txt")
+    with open(sentences_txt_path, "w", encoding="utf-8") as f:
+        for s in sentence_segments:
+            f.write(f"{s.start:.3f}\t{s.end:.3f}\t{s.label}\n")
 
-    # =========================
-    # SAVE TextGrid
-    # =========================
     tg = TextGrid(minTime=0.0, maxTime=total_duration)
-    word_tier = IntervalTier(name="words", minTime=0.0, maxTime=total_duration)
+    word_tier = IntervalTier(name="words_norm", minTime=0.0, maxTime=total_duration)
+    sent_tier = IntervalTier(name="sentences_punct", minTime=0.0, maxTime=total_duration)
 
-    for w in aligned_words_all:
+    for w in aligned_words_norm_all:
         if w.end > w.start:
             word_tier.add(w.start, w.end, w.label)
 
-    tg.append(word_tier)
-    tg.write(os.path.join(OUTPUT_DIR, "alignment.TextGrid"))
+    for s in sentence_segments:
+        if s.end > s.start:
+            sent_tier.add(s.start, s.end, s.label)
 
-    # =========================
-    # SAVE DEBUG JSON
-    # =========================
-    debug_json_path = os.path.join(OUTPUT_DIR, "debug_segments.json")
-    with open(debug_json_path, "w", encoding="utf-8") as f:
-        json.dump(debug_segments, f, ensure_ascii=False, indent=2)
+    tg.append(word_tier)
+    tg.append(sent_tier)
+
+    textgrid_path = os.path.join(OUTPUT_DIR, f"{base_stem}.TextGrid")
+    tg.write(textgrid_path)
 
     print("\nDone.")
     print("Saved:")
     print(words_txt_path)
-    print(segments_txt_path)
-    print(os.path.join(OUTPUT_DIR, "alignment.TextGrid"))
-    print(debug_json_path)
+    print(sentences_txt_path)
+    print(textgrid_path)
+    print(SENTENCE_WAV_DIR)
 
 
 if __name__ == "__main__":
